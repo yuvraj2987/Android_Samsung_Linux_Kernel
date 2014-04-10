@@ -23,6 +23,7 @@
 #include <linux/input.h>
 #include <linux/major.h>
 #include <linux/device.h>
+#include <linux/event_log.h>
 #include <linux/wakelock.h>
 #include "input-compat.h"
 
@@ -57,6 +58,7 @@ struct evdev_client {
 static struct evdev *evdev_table[EVDEV_MINORS];
 static DEFINE_MUTEX(evdev_table_mutex);
 
+
 static void evdev_pass_event(struct evdev_client *client,
 			     struct input_event *event)
 {
@@ -65,7 +67,7 @@ static void evdev_pass_event(struct evdev_client *client,
 
 	client->buffer[client->head++] = *event;
 	client->head &= client->bufsize - 1;
-
+	log_event_generated(client->evdev->minor,1);
 	if (unlikely(client->head == client->tail)) {
 		/*
 		 * This effectively "drops" all unconsumed events, leaving
@@ -81,6 +83,8 @@ static void evdev_pass_event(struct evdev_client *client,
 		client->packet_head = client->tail;
 		if (client->use_wake_lock)
 			wake_unlock(&client->wake_lock);
+		/*Now pass that info to logger.*/
+		log_event_dropped(client->evdev->minor,client->bufsize);
 	}
 
 	if (event->type == EV_SYN && event->code == SYN_REPORT) {
@@ -113,12 +117,12 @@ static void evdev_event(struct input_handle *handle,
 
 	rcu_read_lock();
 
-	client = rcu_dereference(evdev->grab);
+
 	if (client)
 		evdev_pass_event(client, &event);
 	else
-		list_for_each_entry_rcu(client, &evdev->client_list, node)
-			evdev_pass_event(client, &event);
+	    list_for_each_entry_rcu(client, &evdev->client_list, node)
+		evdev_pass_event(client, &event);
 
 	rcu_read_unlock();
 
@@ -404,8 +408,10 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 	struct evdev_client *client = file->private_data;
 	struct evdev *evdev = client->evdev;
 	struct input_event event;
+//	struct input_dev *dev = evdev->handle.dev;
+	struct timespec before,after;
+	struct timeval latency;
 	int retval = 0;
-
 	if (count < input_event_size())
 		return -EINVAL;
 
@@ -419,6 +425,8 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 	if (!evdev->exist)
 		return -ENODEV;
 
+	//get the time stamp here.
+	ktime_get_ts(&before);
 	while (retval + input_event_size() <= count &&
 	       evdev_fetch_next_event(client, &event)) {
 
@@ -427,6 +435,16 @@ static ssize_t evdev_read(struct file *file, char __user *buffer,
 
 		retval += input_event_size();
 	}
+	ktime_get_ts(&after);
+	latency.tv_sec = after.tv_sec-before.tv_sec;
+	latency.tv_usec = (after.tv_nsec-before.tv_nsec)/NSEC_PER_USEC;
+	/*
+	  log_request_event_latency(evdev->minor,current->pid,latency);*/
+	log_request_event_latency(evdev->minor,current->pid,latency,retval/input_event_size());
+	
+	log_event_consumed(evdev->minor,current->pid,retval/input_event_size());
+	
+/*	pr_info("%d events dispatched from device: \"%s\" ",count,dev->name);*/
 
 	if (retval == 0 && file->f_flags & O_NONBLOCK)
 		retval = -EAGAIN;
@@ -973,7 +991,7 @@ static int evdev_connect(struct input_handler *handler, struct input_dev *dev,
 			break;
 
 	if (minor == EVDEV_MINORS) {
-		pr_err("no more free evdev devices\n");
+		pr_info("no more free evdev devices\n");
 		return -ENFILE;
 	}
 
@@ -1002,6 +1020,7 @@ static int evdev_connect(struct input_handler *handler, struct input_dev *dev,
 	device_initialize(&evdev->dev);
 
 	error = input_register_handle(&evdev->handle);
+	log_dev_opened(evdev->minor,evdev->handle.dev->name);
 	if (error)
 		goto err_free_evdev;
 
